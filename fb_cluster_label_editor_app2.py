@@ -1,8 +1,11 @@
 # fb_cluster_explorer_editor_FAST.py
 # Full code with performance fixes ONLY (no feature changes):
-# - Loads the cluster sheet using a limited A1 range (faster than get_all_values)
-# - Caches the PostID->row index for the "Facebook" sheet (so Apply is fast)
-# - Keeps every other function/feature the same
+# - Uses ws.get("A1:<endcol>") instead of get_all_values()
+# - Adds cache_resource for gspread client + spreadsheet open
+# - Adds a sidebar form for filters to stop constant reruns
+# - Caches PostID index for writeback (Apply is fast)
+# - Optional: show only top 200 rows in big tables unless "Show all" is checked
+# - Optional: cluster search box to reduce dropdown load
 
 import os
 import time
@@ -93,10 +96,21 @@ def get_creds():
     )
 
 
-def open_sheet(sheet_id: str):
+@st.cache_resource
+def get_gspread_client():
     creds = get_creds()
-    gc = gspread.authorize(creds)
+    return gspread.authorize(creds)
+
+
+@st.cache_resource
+def get_sheet(sheet_id: str):
+    gc = get_gspread_client()
     return gc.open_by_key(sheet_id)
+
+
+def open_sheet(sheet_id: str):
+    # keep function name the same so nothing else changes
+    return get_sheet(sheet_id)
 
 
 def _is_transient(e: Exception) -> bool:
@@ -105,7 +119,7 @@ def _is_transient(e: Exception) -> bool:
         "[500]", "[502]", "[503]", "[504]", "[429]",
         "Internal error", "backendError", "Server Error",
         "rateLimitExceeded", "Connection aborted", "WinError 10054",
-        "ConnectionResetError", "ProtocolError"
+        "ConnectionResetError", "ProtocolError",
     ]
     return any(t in msg for t in tokens)
 
@@ -326,12 +340,18 @@ def cluster_summary(df: pd.DataFrame) -> pd.DataFrame:
         try:
             return int(str(x))
         except:
-            return 10**9
+            return 10 ** 9
 
     out["_cid"] = out["Cluster_ID"].apply(_cid_int)
     out = out.sort_values(["_cid", "Posts"], ascending=[True, False]).drop(columns=["_cid"])
 
     return out
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_cluster_summary(df: pd.DataFrame) -> pd.DataFrame:
+    # caching wrapper so filter changes don't recompute groupby work
+    return cluster_summary(df)
 
 
 # =========================
@@ -376,38 +396,74 @@ def a1(row: int, col: int) -> str:
 # =========================
 st.title("Facebook Cluster Explorer")
 
+# Defaults in session_state for filter form
+if "min_cluster_size" not in st.session_state:
+    st.session_state["min_cluster_size"] = 2
+if "mode" not in st.session_state:
+    st.session_state["mode"] = "All clusters"
+
 with st.sidebar:
     st.header("Data Source")
     sheet_id = st.text_input("Spreadsheet ID", value=DEFAULT_SHEET_ID)
     cluster_tab = st.text_input("Worksheet name", value=DEFAULT_CLUSTER_TAB)
 
-    if st.button("Refresh data"):
-        st.cache_data.clear()
+    col_refresh, _ = st.columns([1, 1])
+    with col_refresh:
+        if st.button("Refresh data"):
+            st.cache_data.clear()
+            st.cache_resource.clear()
 
     st.divider()
     st.header("Cluster filters")
-    min_cluster_size = st.slider("Min cluster size", 1, 300, 2)
 
-    mode = st.radio(
-        "Show mixed clusters",
-        options=[
-            "All clusters",
-            "Only clusters with >1 Narrative",
-            "Only clusters with >1 Misinformation/Hate",
-            "Only clusters with >1 Narrative OR >1 Misinformation/Hate",
-            "Only clusters with >1 Narrative AND >1 Misinformation/Hate",
-        ],
-        index=0
-    )
+    # Form: changing filters won't rerun expensive parts until submitted
+    with st.form("filters_form"):
+        min_cluster_size = st.slider(
+            "Min cluster size",
+            1, 300,
+            value=int(st.session_state["min_cluster_size"]),
+        )
+
+        mode = st.radio(
+            "Show mixed clusters",
+            options=[
+                "All clusters",
+                "Only clusters with >1 Narrative",
+                "Only clusters with >1 Misinformation/Hate",
+                "Only clusters with >1 Narrative OR >1 Misinformation/Hate",
+                "Only clusters with >1 Narrative AND >1 Misinformation/Hate",
+            ],
+            index=[
+                "All clusters",
+                "Only clusters with >1 Narrative",
+                "Only clusters with >1 Misinformation/Hate",
+                "Only clusters with >1 Narrative OR >1 Misinformation/Hate",
+                "Only clusters with >1 Narrative AND >1 Misinformation/Hate",
+            ].index(st.session_state["mode"]) if st.session_state["mode"] in [
+                "All clusters",
+                "Only clusters with >1 Narrative",
+                "Only clusters with >1 Misinformation/Hate",
+                "Only clusters with >1 Narrative OR >1 Misinformation/Hate",
+                "Only clusters with >1 Narrative AND >1 Misinformation/Hate",
+            ] else 0
+        )
+
+        apply_filters = st.form_submit_button("Apply Filters")
+
+    if apply_filters:
+        st.session_state["min_cluster_size"] = int(min_cluster_size)
+        st.session_state["mode"] = mode
 
     st.divider()
     st.header("Bulk label fix")
     bulk_narr = st.selectbox("Set Narrative", options=["(no change)"] + NARRATIVE_OPTIONS, index=0)
     bulk_mh = st.selectbox("Set Misinformation/Hate", options=["(no change)"] + MH_OPTIONS, index=0)
-
     apply_scope = st.radio("Apply scope", ["Selected posts", "All posts in this cluster"], index=0)
     preview_only = st.checkbox("Preview only (don’t write)", value=False)
 
+# Use applied filter values from session_state
+min_cluster_size = int(st.session_state["min_cluster_size"])
+mode = st.session_state["mode"]
 
 # ---- FAST load: detect header width, then load A1:<endcol> only
 with st.spinner("Loading clustered sheet (fast mode)..."):
@@ -429,9 +485,9 @@ if df_raw.empty:
             st.write("No columns (sheet empty).")
     st.stop()
 
-# Cluster summary table
+# Cluster summary table (cached)
 with st.spinner("Building cluster summary..."):
-    df_clusters = cluster_summary(df_raw)
+    df_clusters = cached_cluster_summary(df_raw)
 
 # Apply filters
 dfc = df_clusters.copy()
@@ -472,7 +528,8 @@ df_table = dfc[table_cols].copy()
 df_table["Avg_Engagement"] = df_table["Avg_Engagement"].round(2)
 df_table["Total_Engagement"] = df_table["Total_Engagement"].round(0).astype(int)
 
-st.dataframe(df_table, use_container_width=True, height=360)
+show_all_clusters_table = st.checkbox("Show full mixed-clusters table (slow)", value=False)
+st.dataframe(df_table if show_all_clusters_table else df_table.head(200), use_container_width=True, height=360)
 
 st.divider()
 
@@ -484,7 +541,21 @@ def _short_rep(s: str, n=110) -> str:
     s = re.sub(r"\s+", " ", s)
     return s[:n] + ("…" if len(s) > n else "")
 
+# Search filter to keep dropdown light
+cluster_search = st.text_input("Filter clusters (type to narrow)", value="").strip().lower()
+
 opts = dfc.head(3000).copy()
+if cluster_search:
+    # filter by Cluster_ID or representative snippet
+    mask = (
+        opts["Cluster_ID"].astype(str).str.lower().str.contains(cluster_search, na=False) |
+        opts["Representative"].astype(str).str.lower().str.contains(cluster_search, na=False)
+    )
+    opts = opts[mask].copy()
+    if opts.empty:
+        st.warning("No clusters matched your filter. Clearing filter might help.")
+        opts = dfc.head(3000).copy()
+
 label_map = {
     r["Cluster_ID"]: f'{r["Cluster_ID"]} | Posts:{r["Posts"]} | N:{r["Unique_Narratives"]} MH:{r["Unique_MH"]} | {_short_rep(r["Representative"])}'
     for _, r in opts.iterrows()
@@ -652,7 +723,7 @@ if apply_btn:
         prog.progress(1.0, text="Done.")
         st.success("✅ Updated labels in 'Facebook' sheet.")
 
-        # Keep behavior consistent: refresh caches after a write
+        # keep behavior consistent: refresh caches after a write
         st.cache_data.clear()
 
     except Exception as e:
