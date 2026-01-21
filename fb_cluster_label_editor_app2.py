@@ -597,12 +597,12 @@ with right:
 
     narr_counts = cluster_df[COL_NARR].replace("", "Unknown").value_counts().reset_index()
     narr_counts.columns = ["Narrative", "Posts"]
-    fig1 = px.bar(narr_counts, x="Narrative", y="Posts", title="Narrative")
+    fig1 = px.bar(narr_counts, x="Posts", y="Narrative", orientation="h", title="Narrative")
     st.plotly_chart(fig1, use_container_width=True)
 
     mh_counts = cluster_df[COL_MH].replace("", "Unknown").value_counts().reset_index()
     mh_counts.columns = ["Misinformation/Hate", "Posts"]
-    fig2 = px.bar(mh_counts, x="Misinformation/Hate", y="Posts", title="Misinformation/Hate")
+    fig2 = px.bar(mh_counts, x="Posts", y="Misinformation/Hate", orientation="h", title="Misinformation/Hate")
     st.plotly_chart(fig2, use_container_width=True)
 
 st.divider()
@@ -728,3 +728,4 @@ if apply_btn:
 
     except Exception as e:
         st.error(f"Write failed: {e}")
+
